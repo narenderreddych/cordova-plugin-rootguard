@@ -1,554 +1,399 @@
 
 package com.rootguard.detection;
 
-import org.apache.cordova.CordovaPlugin;
+import android.os.Build;
+
 import org.apache.cordova.CallbackContext;
+import org.apache.cordova.CordovaPlugin;
 import org.json.JSONArray;
 import org.json.JSONException;
-
-import android.content.pm.PackageInfo;
-import android.content.pm.PackageManager;
-import android.os.Build;
-import android.util.Log;
+import org.json.JSONObject;
 
 import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.InputStreamReader;
-import java.io.ByteArrayOutputStream;
+import java.io.FileReader;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
-import java.security.MessageDigest;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Locale;
-import java.util.concurrent.TimeUnit;
+import java.util.Set;
 
-public class RootGuard extends CordovaPlugin {
+/**
+ * Local, best-effort compromise detection.
+ *
+ * This class deliberately avoids shell commands. A command failure or timeout is
+ * a capability failure, never evidence of compromise. High-assurance enforcement
+ * belongs on a backend using Play Integrity; see SECURITY.md.
+ */
+public final class RootGuard extends CordovaPlugin {
+    private static final int SAFE = 0;
+    private static final int COMPROMISED = 1;
+    private static final int UNKNOWN = 2;
+    private static final int ANDROID_13 = 33;
+    private static final int SOCKET_TIMEOUT_MS = 60;
+    private static final int MAX_MAP_LINES = 20000;
+    private static final int MAX_FDS = 512;
+    private static final int MAX_TASKS = 512;
+    private static final int MAX_TCP_LINES = 256;
+    private static final int MAX_PROTOCOL_PORTS = 8;
 
-    private static final String TAG = "RootGuard";
-    private static final boolean ENABLE_LOGS = true;
+    private enum State { DETECTED, CLEAR, UNAVAILABLE }
+    private enum Strength { HIGH, MEDIUM }
 
-    private static final int COMMAND_TIMEOUT_MS = 1000;
-    private static final int SOCKET_TIMEOUT_MS = 350;
+    private static final class Signal {
+        final String id;
+        final String category;
+        final State state;
+        final Strength strength;
 
-    /*
-     * Optional signing-certificate pin.
-     *
-     * Set this to the SHA-256 fingerprint of your expected release
-     * signing certificate, with or without colons.
-     *
-     * Leave empty to disable the signing check.
-     * Do not use a debug certificate fingerprint for production.
-     */
-    private static final String EXPECTED_CERT_SHA256 = "";
+        Signal(String id, String category, State state, Strength strength) {
+            this.id = id;
+            this.category = category;
+            this.state = state;
+            this.strength = strength;
+        }
+    }
+
+    private static final class Assessment {
+        final int status;
+        final List<Signal> signals;
+        final List<String> unknownReasons;
+
+        Assessment(int status, List<Signal> signals, List<String> unknownReasons) {
+            this.status = status;
+            this.signals = signals;
+            this.unknownReasons = unknownReasons;
+        }
+    }
 
     @Override
-    public boolean execute(
-            String action,
-            JSONArray args,
-            CallbackContext callbackContext
-    ) throws JSONException {
-
-        if (!"checkSecurity".equals(action)) {
+    public boolean execute(String action, JSONArray args, CallbackContext callback) throws JSONException {
+        if (!"checkSecurity".equals(action)
+                && !"checkSecurityStatus".equals(action)
+                && !"checkSecurityDetailed".equals(action)) {
             return false;
         }
 
         cordova.getThreadPool().execute(() -> {
+            Assessment assessment;
             try {
-                boolean compromised = isDeviceRooted()
-                        || isFridaPresent()
-                        || hasSuspiciousRuntimeIndicators()
-                        || hasUnexpectedSigningCertificate();
+                assessment = assess();
+            } catch (Throwable ignored) {
+                List<String> unknownReasons = new ArrayList<>();
+                unknownReasons.add("assessment_exception");
+                assessment = new Assessment(UNKNOWN, new ArrayList<>(), unknownReasons);
+            }
 
-                callbackContext.success(compromised ? 1 : 0);
-
-            } catch (Exception e) {
-                log("Security check failed unexpectedly: "
-                        + e.getClass().getSimpleName());
-
-                // Fail closed: do not silently allow an unexpected
-                // detector exception. This can block legitimate devices.
-                callbackContext.success(1);
+            if ("checkSecurity".equals(action)) {
+                // Backward compatibility: the legacy API remains binary and UNKNOWN
+                // must not lock out existing users.
+                callback.success(assessment.status == COMPROMISED ? 1 : 0);
+            } else if ("checkSecurityStatus".equals(action)) {
+                callback.success(assessment.status);
+            } else {
+                callback.success(toJson(assessment));
             }
         });
-
         return true;
     }
 
-    // ============================================================
-    // ROOT / MAGISK / ZYGISK INDICATORS
-    // ============================================================
+    private Assessment assess() {
+        List<Signal> signals = new ArrayList<>();
+        signals.add(checkRootArtifacts());
+        signals.add(checkSuOnPath());
+        signals.add(checkBuildProvenance());
+        signals.add(checkProcessMaps());
+        signals.add(checkFileDescriptors());
+        signals.add(checkThreadNames());
+        signals.add(checkFridaProtocol());
 
-    private boolean isDeviceRooted() {
+        int high = countDetected(signals, Strength.HIGH);
+        int medium = countDetected(signals, Strength.MEDIUM);
+        boolean criticalUnavailable = criticalChecksUnavailable(signals);
+        List<String> unknownReasons = new ArrayList<>();
+        int status;
+        if (high > 0 || medium >= 2) {
+            status = COMPROMISED;
+        } else {
+            if (medium == 1) {
+                unknownReasons.add("single_medium_signal");
+            }
+            if (criticalUnavailable) {
+                unknownReasons.add("critical_check_unavailable");
+            }
+            if (Build.VERSION.SDK_INT >= ANDROID_13) {
+                // Local absence checks cannot establish device integrity on modern
+                // Android. A server-verified Play Integrity verdict is required.
+                unknownReasons.add("modern_android_local_integrity_unverifiable");
+            }
+            status = unknownReasons.isEmpty() ? SAFE : UNKNOWN;
+        }
+        return new Assessment(status, signals, unknownReasons);
+    }
 
-        String[] rootPaths = {
+    private Signal checkRootArtifacts() {
+        String[] paths = {
                 "/system/app/Superuser.apk",
-                "/system/app/SuperSU.apk",
-                "/system/xbin/su",
                 "/system/bin/su",
+                "/system/xbin/su",
+                "/system/bin/.ext/.su",
+                "/system/usr/we-need-root/su-backup",
                 "/sbin/su",
-                "/system/sd/xbin/su",
-                "/system/bin/failsafe/su",
-                "/data/local/xbin/su",
-                "/data/local/bin/su",
-                "/data/local/su",
                 "/su/bin/su",
-                "/vendor/bin/su",
-                "/system/su",
                 "/sbin/.magisk",
-                "/debug_ramdisk/.magisk",
+                "/cache/magisk.log",
                 "/data/adb/magisk",
-                "/data/adb/zygisk"
+                "/data/adb/ksu",
+                "/data/adb/ap"
         };
-
-        for (String path : rootPaths) {
-            if (new File(path).exists()) {
-                log("Root-related artifact detected: " + path);
-                return true;
-            }
-        }
-
-        // /data/adb/modules is a Magisk-related indicator, but its
-        // visibility and meaning depend on the device and configuration.
-        if (new File("/data/adb/modules").exists()) {
-            log("Magisk modules directory detected");
-            return true;
-        }
-
-        if (hasSuspiciousBuildTags()) {
-            return true;
-        }
-
-        if (hasSuspiciousSystemProperties()) {
-            return true;
-        }
-
-        if (checkSuCommand()) {
-            return true;
-        }
-
-        if (checkWritableSystemMounts()) {
-            return true;
-        }
-
-        return false;
-    }
-
-    private boolean hasSuspiciousBuildTags() {
-
-        String tags = Build.TAGS;
-        String fingerprint = Build.FINGERPRINT;
-        String buildType = Build.TYPE;
-
-        if (tags != null) {
-            String lowerTags = tags.toLowerCase(Locale.US);
-
-            if (lowerTags.contains("test-keys")) {
-                log("Test-keys build tag detected");
-                return true;
-            }
-        }
-
-        if (buildType != null) {
-            if ("eng".equalsIgnoreCase(buildType)
-                    || "userdebug".equalsIgnoreCase(buildType)) {
-                log("Non-production Android build type detected");
-                return true;
-            }
-        }
-
-        if (fingerprint != null) {
-            String lowerFingerprint =
-                    fingerprint.toLowerCase(Locale.US);
-
-            if (lowerFingerprint.contains("generic")
-                    || lowerFingerprint.contains("userdebug")
-                    || lowerFingerprint.contains("test-keys")) {
-                log("Suspicious build fingerprint detected");
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private boolean hasSuspiciousSystemProperties() {
-
-        String output = runCommand("getprop");
-
-        if (output == null || output.length() == 0) {
-            log("System properties unavailable; no conclusion from getprop");
-            return false;
-        }
-
-        String lower = output.toLowerCase(Locale.US);
-
-        String[] suspiciousProperties = {
-                "[ro.debuggable]: [1]",
-                "[ro.secure]: [0]",
-                "[ro.build.type]: [userdebug]",
-                "[ro.build.type]: [eng]"
-        };
-
-        for (String property : suspiciousProperties) {
-            if (lower.contains(property)) {
-                log("Suspicious system property detected: " + property);
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private boolean checkSuCommand() {
-
-        String output = runCommand("which su");
-
-        if (output != null) {
-            String trimmed = output.trim();
-
-            if (trimmed.length() > 0
-                    && trimmed.contains("/")) {
-                log("su executable reported by which");
-                return true;
-            }
-        }
-
-        String[] suPaths = {
-                "/system/xbin/su",
-                "/system/bin/su",
-                "/sbin/su",
-                "/vendor/bin/su",
-                "/su/bin/su"
-        };
-
-        for (String path : suPaths) {
-            if (new File(path).exists()) {
-                log("su executable found: " + path);
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private boolean checkWritableSystemMounts() {
-
-        String output = runCommand("mount");
-
-        if (output == null || output.length() == 0) {
-            log("Mount information unavailable");
-            return false;
-        }
-
-        String[] lines = output.split("\\n");
-
-        for (String line : lines) {
-            String lower = line.toLowerCase(Locale.US);
-
-            boolean relevantMount =
-                    lower.contains(" on /system ")
-                    || lower.contains(" on /system/")
-                    || lower.contains(" on /vendor ")
-                    || lower.contains(" on /vendor/")
-                    || lower.contains(" on /");
-
-            if (!relevantMount) {
-                continue;
-            }
-
-            // Check mount options rather than matching "rw" anywhere
-            // in the line. This is an indicator, not definitive proof.
-            int optionsStart = line.indexOf('(');
-            int optionsEnd = line.indexOf(')');
-
-            if (optionsStart >= 0 && optionsEnd > optionsStart) {
-                String options = line.substring(
-                        optionsStart + 1, optionsEnd
-                );
-
-                String[] tokens = options.split(",");
-
-                for (String token : tokens) {
-                    if ("rw".equals(token.trim())) {
-                        log("Potentially writable system mount detected");
-                        return true;
-                    }
+        try {
+            for (String path : paths) {
+                if (new File(path).exists()) {
+                    return new Signal("root_artifact", "root", State.DETECTED, Strength.HIGH);
                 }
             }
+            return new Signal("root_artifact", "root", State.CLEAR, Strength.HIGH);
+        } catch (SecurityException ignored) {
+            return new Signal("root_artifact", "root", State.UNAVAILABLE, Strength.HIGH);
         }
-
-        return false;
     }
 
-    // ============================================================
-    // FRIDA / RUNTIME INSTRUMENTATION INDICATORS
-    // ============================================================
-
-    private boolean isFridaPresent() {
-
-        if (isPortOpen(27042) || isPortOpen(27043)) {
-            log("Potential Frida server port detected");
-            return true;
+    private Signal checkSuOnPath() {
+        String path = System.getenv("PATH");
+        if (path == null || path.length() == 0) {
+            return new Signal("su_path", "root", State.UNAVAILABLE, Strength.HIGH);
         }
-
-        String maps = readProcFile("/proc/self/maps");
-
-        if (maps != null) {
-            String lower = maps.toLowerCase(Locale.US);
-
-            String[] indicators = {
-                    "frida",
-                    "frida-agent",
-                    "frida-gadget",
-                    "gum-js-loop",
-                    "gadget-"
-            };
-
-            for (String indicator : indicators) {
-                if (lower.contains(indicator)) {
-                    log("Runtime instrumentation indicator detected: "
-                            + indicator);
-                    return true;
+        try {
+            for (String directory : path.split(":")) {
+                File candidate = new File(directory, "su");
+                if (candidate.isFile() && candidate.canExecute()) {
+                    return new Signal("su_path", "root", State.DETECTED, Strength.HIGH);
                 }
             }
-        }
-
-        String processOutput = runCommand("pidof frida-server");
-
-        if (processOutput != null
-                && processOutput.trim().length() > 0) {
-            log("Frida server process detected");
-            return true;
-        }
-
-        return false;
-    }
-
-    private boolean hasSuspiciousRuntimeIndicators() {
-
-        String maps = readProcFile("/proc/self/maps");
-
-        if (maps == null) {
-            // A failed read alone is not proof of compromise.
-            return false;
-        }
-
-        String lower = maps.toLowerCase(Locale.US);
-
-        String[] indicators = {
-                "libsubstrate",
-                "libxposed",
-                "lsposed",
-                "zygisk"
-        };
-
-        for (String indicator : indicators) {
-            if (lower.contains(indicator)) {
-                log("Possible runtime modification indicator: "
-                        + indicator);
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private boolean isPortOpen(int port) {
-
-        Socket socket = new Socket();
-
-        try {
-            socket.connect(
-                    new InetSocketAddress("127.0.0.1", port),
-                    SOCKET_TIMEOUT_MS
-            );
-            return true;
-
-        } catch (Exception e) {
-            return false;
-
-        } finally {
-            try {
-                socket.close();
-            } catch (Exception ignored) {
-            }
+            return new Signal("su_path", "root", State.CLEAR, Strength.HIGH);
+        } catch (SecurityException ignored) {
+            return new Signal("su_path", "root", State.UNAVAILABLE, Strength.HIGH);
         }
     }
 
-    // ============================================================
-    // OPTIONAL APK SIGNING-CERTIFICATE CHECK
-    // ============================================================
-
-    private boolean hasUnexpectedSigningCertificate() {
-
-        if (EXPECTED_CERT_SHA256 == null
-                || EXPECTED_CERT_SHA256.trim().length() == 0) {
-            return false;
-        }
-
-        try {
-            PackageManager pm = cordova.getActivity()
-                    .getPackageManager();
-
-            PackageInfo info = pm.getPackageInfo(
-                    cordova.getActivity().getPackageName(),
-                    PackageManager.GET_SIGNATURES
-            );
-
-            if (info.signatures == null
-                    || info.signatures.length == 0) {
-                log("Application signing certificate unavailable");
-                return true;
-            }
-
-            String expected = EXPECTED_CERT_SHA256
-                    .replace(":", "")
-                    .trim()
-                    .toLowerCase(Locale.US);
-
-            for (android.content.pm.Signature signature
-                    : info.signatures) {
-
-                byte[] digest = MessageDigest.getInstance("SHA-256")
-                        .digest(signature.toByteArray());
-
-                String actual = toHex(digest);
-
-                if (expected.equals(actual)) {
-                    return false;
-                }
-            }
-
-            log("Installed application signing certificate mismatch");
-            return true;
-
-        } catch (Exception e) {
-            log("Unable to verify application signing certificate");
-            return true;
-        }
+    private Signal checkBuildProvenance() {
+        String tags = Build.TAGS == null ? "" : Build.TAGS.toLowerCase(Locale.US);
+        String type = Build.TYPE == null ? "" : Build.TYPE.toLowerCase(Locale.US);
+        boolean nonProduction = tags.contains("test-keys") || "eng".equals(type) || "userdebug".equals(type);
+        return new Signal("non_production_build", "root", nonProduction ? State.DETECTED : State.CLEAR,
+                Strength.MEDIUM);
     }
 
-    private String toHex(byte[] bytes) {
-
-        StringBuilder result = new StringBuilder();
-
-        for (byte b : bytes) {
-            result.append(String.format(
-                    Locale.US, "%02x", b & 0xff
-            ));
-        }
-
-        return result.toString();
-    }
-
-    // ============================================================
-    // HELPERS
-    // ============================================================
-
-    private String readProcFile(String path) {
-
-        BufferedReader reader = null;
-
-        try {
-            reader = new BufferedReader(
-                    new InputStreamReader(
-                            new FileInputStream(path)
-                    )
-            );
-
-            StringBuilder result = new StringBuilder();
+    private Signal checkProcessMaps() {
+        try (BufferedReader reader = new BufferedReader(new FileReader("/proc/self/maps"))) {
             String line;
-
-            while ((line = reader.readLine()) != null) {
-                result.append(line).append('\n');
-            }
-
-            return result.toString();
-
-        } catch (Exception e) {
-            return null;
-
-        } finally {
-            if (reader != null) {
-                try {
-                    reader.close();
-                } catch (Exception ignored) {
+            int count = 0;
+            while ((line = reader.readLine()) != null && count++ < MAX_MAP_LINES) {
+                String value = line.toLowerCase(Locale.US);
+                if (containsInstrumentationMarker(value)) {
+                    return new Signal("instrumentation_map", "instrumentation", State.DETECTED, Strength.HIGH);
                 }
             }
+            return new Signal("instrumentation_map", "instrumentation", State.CLEAR, Strength.HIGH);
+        } catch (Exception ignored) {
+            return new Signal("instrumentation_map", "instrumentation", State.UNAVAILABLE, Strength.HIGH);
         }
     }
 
-    /*
-     * Runs a command with a timeout without relying on newer
-     * Process.waitFor(timeout, TimeUnit) Android APIs.
-     */
-    private String runCommand(String command) {
-
-        Process process = null;
-        ByteArrayOutputStream output = new ByteArrayOutputStream();
-        Thread readerThread = null;
-
+    private Signal checkFileDescriptors() {
+        File directory = new File("/proc/self/fd");
+        File[] descriptors;
         try {
-            process = new ProcessBuilder(
-                    "/system/bin/sh", "-c", command
-            ).redirectErrorStream(true).start();
+            descriptors = directory.listFiles();
+        } catch (SecurityException ignored) {
+            descriptors = null;
+        }
+        if (descriptors == null) {
+            return new Signal("instrumentation_fd", "instrumentation", State.UNAVAILABLE, Strength.HIGH);
+        }
 
-            final Process runningProcess = process;
-            final ByteArrayOutputStream capturedOutput = output;
+        int count = 0;
+        for (File descriptor : descriptors) {
+            if (count++ >= MAX_FDS) break;
+            try {
+                if (containsInstrumentationMarker(descriptor.getCanonicalPath().toLowerCase(Locale.US))) {
+                    return new Signal("instrumentation_fd", "instrumentation", State.DETECTED, Strength.HIGH);
+                }
+            } catch (Exception ignored) {
+                // Individual descriptors can disappear while being enumerated.
+            }
+        }
+        return new Signal("instrumentation_fd", "instrumentation", State.CLEAR, Strength.HIGH);
+    }
 
-            readerThread = new Thread(() -> {
-                byte[] buffer = new byte[1024];
+    private Signal checkThreadNames() {
+        File directory = new File("/proc/self/task");
+        File[] tasks;
+        try {
+            tasks = directory.listFiles();
+        } catch (SecurityException ignored) {
+            tasks = null;
+        }
+        if (tasks == null) {
+            return new Signal("instrumentation_thread", "instrumentation", State.UNAVAILABLE, Strength.HIGH);
+        }
 
-                try {
-                    java.io.InputStream input =
-                            runningProcess.getInputStream();
+        boolean genericGlibThread = false;
+        int count = 0;
+        for (File task : tasks) {
+            if (count++ >= MAX_TASKS) break;
+            try (BufferedReader reader = new BufferedReader(new FileReader(new File(task, "comm")))) {
+                String name = reader.readLine();
+                if (name == null) continue;
+                String value = name.trim().toLowerCase(Locale.US);
+                if (containsInstrumentationMarker(value)
+                        || value.contains("pool-frida")
+                        || value.contains("gmain-frida")) {
+                    return new Signal("instrumentation_thread", "instrumentation",
+                            State.DETECTED, Strength.HIGH);
+                }
+                // gmain/gdbus are associated with Frida's GLib runtime, but
+                // legitimate software can use them too. Never treat either as
+                // conclusive without a second independent signal.
+                if ("gmain".equals(value) || "gdbus".equals(value)) {
+                    genericGlibThread = true;
+                }
+            } catch (Exception ignored) {
+                // Threads can exit while /proc/self/task is being enumerated.
+            }
+        }
+        return new Signal("instrumentation_thread", "instrumentation",
+                genericGlibThread ? State.DETECTED : State.CLEAR,
+                genericGlibThread ? Strength.MEDIUM : Strength.HIGH);
+    }
 
-                    int count;
+    private Signal checkFridaProtocol() {
+        Set<Integer> ports = new LinkedHashSet<>();
+        ports.add(27042);
+        ports.add(27043);
+        ports.add(27044);
+        ports.add(27045);
+        addListeningPorts("/proc/self/net/tcp", ports);
+        addListeningPorts("/proc/self/net/tcp6", ports);
 
-                    while ((count = input.read(buffer)) != -1) {
-                        synchronized (capturedOutput) {
-                            capturedOutput.write(buffer, 0, count);
-                        }
+        boolean portOpen = false;
+        for (int port : ports) {
+            boolean knownFridaPort = port >= 27042 && port <= 27045;
+            try (Socket socket = new Socket()) {
+                socket.connect(new InetSocketAddress("127.0.0.1", port), SOCKET_TIMEOUT_MS);
+                socket.setSoTimeout(SOCKET_TIMEOUT_MS);
+                portOpen = true;
+
+                OutputStream output = socket.getOutputStream();
+                output.write(new byte[]{0});
+                output.write("AUTH\r\n".getBytes(StandardCharsets.US_ASCII));
+                output.flush();
+
+                InputStream input = socket.getInputStream();
+                byte[] response = new byte[96];
+                int length = input.read(response);
+                if (length > 0) {
+                    String banner = new String(response, 0, length, StandardCharsets.US_ASCII)
+                            .toUpperCase(Locale.US);
+                    if (banner.contains("REJECTED") || banner.contains("OK") || banner.contains("AGREE")) {
+                        // D-Bus authentication is Frida-compatible but not unique
+                        // to Frida. It is conclusive only on its known ports; a
+                        // custom port must be corroborated by another signal.
+                        return new Signal("frida_protocol", "instrumentation", State.DETECTED,
+                                knownFridaPort ? Strength.HIGH : Strength.MEDIUM);
                     }
-
-                } catch (Exception ignored) {
                 }
-            });
-
-            readerThread.setDaemon(true);
-            readerThread.start();
-            readerThread.join(COMMAND_TIMEOUT_MS);
-
-            if (readerThread.isAlive()) {
-                process.destroy();
-                readerThread.join(100);
+            } catch (Exception ignored) {
+                // A refused connection or protocol timeout is not evidence.
             }
+        }
+        return new Signal("frida_protocol", "instrumentation",
+                portOpen ? State.DETECTED : State.CLEAR, Strength.MEDIUM);
+    }
 
-            synchronized (output) {
-                return output.toString("UTF-8");
+    private void addListeningPorts(String path, Set<Integer> ports) {
+        try (BufferedReader reader = new BufferedReader(new FileReader(path))) {
+            String line;
+            int count = 0;
+            while ((line = reader.readLine()) != null && count++ < MAX_TCP_LINES
+                    && ports.size() < MAX_PROTOCOL_PORTS) {
+                String[] columns = line.trim().split("\\s+");
+                if (columns.length < 4 || !"0A".equals(columns[3])) continue;
+                String[] address = columns[1].split(":");
+                if (address.length != 2) continue;
+                int port = Integer.parseInt(address[1], 16);
+                if (port > 1024 && port <= 65535) ports.add(port);
             }
-
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return null;
-
-        } catch (Exception e) {
-            log("Command unavailable: " + command);
-            return null;
-
-        } finally {
-            if (process != null) {
-                try {
-                    process.destroy();
-                } catch (Exception ignored) {
-                }
-            }
+        } catch (Exception ignored) {
+            // Procfs visibility varies. Default/common ports are still checked.
         }
     }
 
-    private void log(String message) {
-        if (ENABLE_LOGS) {
-            Log.d(TAG, message);
+    private boolean containsInstrumentationMarker(String value) {
+        return value.contains("frida")
+                || value.contains("gum-js")
+                || value.contains("linjector")
+                || value.contains("/re.frida.")
+                || value.contains("zygisk");
+    }
+
+    private int countDetected(List<Signal> signals, Strength strength) {
+        int count = 0;
+        for (Signal signal : signals) {
+            if (signal.state == State.DETECTED && signal.strength == strength) count++;
         }
+        return count;
+    }
+
+    private boolean criticalChecksUnavailable(List<Signal> signals) {
+        boolean mapsUnavailable = false;
+        boolean rootChecksUnavailable = true;
+        for (Signal signal : signals) {
+            if ("instrumentation_map".equals(signal.id) && signal.state == State.UNAVAILABLE) {
+                mapsUnavailable = true;
+            }
+            if ("root".equals(signal.category) && signal.strength == Strength.HIGH
+                    && signal.state != State.UNAVAILABLE) {
+                rootChecksUnavailable = false;
+            }
+        }
+        return mapsUnavailable || rootChecksUnavailable;
+    }
+
+    private JSONObject toJson(Assessment assessment) {
+        JSONObject result = new JSONObject();
+        JSONArray evidence = new JSONArray();
+        JSONArray unavailable = new JSONArray();
+        JSONArray unknownReasons = new JSONArray();
+        try {
+            for (String reason : assessment.unknownReasons) unknownReasons.put(reason);
+            for (Signal signal : assessment.signals) {
+                if (signal.state == State.DETECTED) evidence.put(signal.id);
+                if (signal.state == State.UNAVAILABLE) unavailable.put(signal.id);
+            }
+            result.put("status", assessment.status);
+            result.put("statusName", statusName(assessment.status));
+            result.put("platform", "android");
+            result.put("osVersion", Build.VERSION.RELEASE);
+            result.put("apiLevel", Build.VERSION.SDK_INT);
+            result.put("evidence", evidence);
+            result.put("unavailableChecks", unavailable);
+            result.put("unknownReasons", unknownReasons);
+            result.put("localOnly", true);
+        } catch (JSONException ignored) {
+            // All keys and values above are JSON-compatible.
+        }
+        return result;
+    }
+
+    private String statusName(int status) {
+        if (status == COMPROMISED) return "COMPROMISED";
+        if (status == UNKNOWN) return "UNKNOWN";
+        return "SAFE";
     }
 }
