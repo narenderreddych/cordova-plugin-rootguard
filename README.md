@@ -11,12 +11,24 @@
 </p>
 
 **`cordova-plugin-rootguard`** is a security plugin for Cordova that detects:
-- ✅ Root access (Magisk, SuperSU, `su` binaries, system mount modifications) – **Android**
+- ✅ Root access (Magisk, Zygisk, SuperSU, `su` binaries, system mount modifications) – **Android**
 - ✅ Frida instrumentation (open ports, memory maps, processes) – **Android**
 - ✅ Jailbreak status (Cydia, Sileo, rootless indicators) – **iOS**
 - ✅ Frida runtime detection (dylib injection) – **iOS**
 
 ## Changelog
+### 12-10-2025
+
+## AndroidZygiskRootDetectionFix — Fix Summary
+- Enhanced root detection for Magisk, Zygisk, KernelSU, APatch, SuperSU, and root artifacts.
+- Improved Frida and runtime instrumentation detection.
+- Added shell command timeouts and safe process cleanup to prevent plugin hangs.
+- Moved security checks to the Cordova thread pool to avoid UI blocking.
+- Reduced false positives from arbitrary ports and thread names.
+- Preserved existing Ionic/Cordova JavaScript integration and result handling.
+- Android-only changes; iOS detection remains unchanged.
+# Limitation: Zygisk and root-hiding bypasses cannot be detected in every configuration. Final validation against VAPT test scenarios is required.
+
 ### 02-10-2025
 - Fix(android): prevent plugin timeout on Magisk/RootAVD by adding process timeouts and safe cleanup
   - Moved root and Frida detection checks to Cordova thread pool
